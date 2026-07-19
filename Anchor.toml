@@ -1,0 +1,14 @@
+[toolchain]
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.devnet]
+spt_x402_escrow = "C9kTmtYm5V8cFfNvgzJAcVfM2zYN1Pqv245Xe27h4NwZ"
+
+[provider]
+cluster = "devnet"
+wallet = "~/.config/solana/id.json"
+
+[hooks]

@@ -1,0 +1,12 @@
+{
+  "name": "SPT-Txn x402 Escrow",
+  "project_url": "https://foss.violetskysecurity.com",
+  "contacts": [
+    "email:rudi@violetskysecurity.com",
+    "link:https://foss.violetskysecurity.com"
+  ],
+  "policy": "Report vulnerabilities privately to rudi@violetskysecurity.com. Please allow reasonable time for remediation before any public disclosure. Coordinated disclosure is appreciated.",
+  "preferred_languages": ["en"],
+  "encryption": "",
+  "auditors": ["Internal adversarial review (2 passes); litesvm + differential test suite"]
+}

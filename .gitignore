@@ -1,0 +1,22 @@
+# Key material — NEVER commit (secrets even on devnet)
+*keypair*.json
+*-devnet.json
+*-mainnet.json
+id.json
+*.pem
+*.key
+.env
+.env.*
+
+# Rust / Anchor build artifacts
+target/
+.anchor/
+test-ledger/
+node_modules/
+dist/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
