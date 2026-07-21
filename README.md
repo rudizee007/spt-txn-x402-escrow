@@ -11,7 +11,7 @@ mismatch, stale freshness, or a replayed nonce all revert. This is the trustless
 settlement path that complements the off-chain gate in
 [spt-txn-x402-solana](https://github.com/rudizee007/spt-txn-x402-solana).
 
-- **Deployed on devnet:** `JUYFyssaZLPb1fwTgNJG6MwmfQKnUvCvSmhjWA5sgdk`
+- **Deployed on devnet:** [`C9kTmtYm5V8cFfNvgzJAcVfM2zYN1Pqv245Xe27h4NwZ`](https://explorer.solana.com/address/C9kTmtYm5V8cFfNvgzJAcVfM2zYN1Pqv245Xe27h4NwZ?cluster=devnet) — upgrade authority held by the deployer.
 - Spec: [`docs/SPEC.md`](docs/SPEC.md) · Threat model: [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md)
 
 ## What it enforces on-chain
