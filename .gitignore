@@ -20,3 +20,6 @@ dist/
 *.swp
 .idea/
 .vscode/
+
+# Dumped on-chain program bytes (verification scratch)
+onchain.so

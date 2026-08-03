@@ -58,3 +58,27 @@ a final human line-by-line review. Report vulnerabilities per
 
 Apache-2.0. Built on the open SPT-Txn reference implementation and the IETF
 `draft-coetzee-oauth-spt-txn-tokens`.
+
+## Building — use `cargo build-sbf`, not `anchor build`
+
+The program keypair that originally chose the address
+`C9kTmtYm5V8cFfNvgzJAcVfM2zYN1Pqv245Xe27h4NwZ` is not on this machine. Anchor
+syncs `declare_id!` and `Anchor.toml` from `target/deploy/*-keypair.json`
+*before* it compiles, so `anchor build` silently rewrites both files to whatever
+keypair it finds or generates, and produces a binary that declares the wrong ID.
+Deploying that binary bricks the program: Anchor's runtime ID check rejects
+every instruction before your code runs.
+
+Build with:
+
+    cargo build-sbf --manifest-path programs/spt_x402_escrow/Cargo.toml
+
+Upgrade with:
+
+    solana program deploy target/deploy/spt_x402_escrow.so \
+      --program-id C9kTmtYm5V8cFfNvgzJAcVfM2zYN1Pqv245Xe27h4NwZ \
+      --url devnet --upgrade-authority ~/.config/solana/id.json
+
+The upgrade authority signs upgrades; the program keypair is only needed for a
+first deploy, which is already done. A `pre-commit` hook refuses any commit where
+`declare_id!` has drifted.
