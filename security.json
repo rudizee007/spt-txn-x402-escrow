@@ -6,7 +6,11 @@
     "link:https://foss.violetskysecurity.com"
   ],
   "policy": "Report vulnerabilities privately to rudi@violetskysecurity.com. Please allow reasonable time for remediation before any public disclosure. Coordinated disclosure is appreciated.",
-  "preferred_languages": ["en"],
-  "encryption": "",
-  "auditors": ["Internal adversarial review (2 passes); litesvm + differential test suite"]
+  "preferred_languages": [
+    "en"
+  ],
+  "auditors": [
+    "Internal adversarial review (2 passes); litesvm + differential test suite"
+  ],
+  "policy_url": "https://github.com/rudizee007/spt-txn-x402-escrow/blob/main/SECURITY.md"
 }
