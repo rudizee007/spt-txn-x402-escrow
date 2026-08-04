@@ -46,12 +46,12 @@ and [`SPEC.md`](SPEC.md) §5.4.
 
 ## Dependency audit status
 
-Last run **2026-08-03** against `RustSec/advisory-db` (1186 advisories),
+Last run **2026-08-04** against `RustSec/advisory-db` (1186 advisories),
 414 crate dependencies.
 
-`cargo audit` reports two vulnerabilities and six unmaintained-crate warnings.
-**Neither vulnerability is present in the deployed program.** Both arrive
-through `[dev-dependencies]`:
+`cargo audit` reports two vulnerabilities, one unsoundness warning, and five
+unmaintained-crate warnings. **None of the three defects is present in the
+deployed program.** All arrive through `[dev-dependencies]`:
 
 ```
 curve25519-dalek v3.2.0
@@ -74,30 +74,64 @@ contain them.
 | [RUSTSEC-2022-0093](https://rustsec.org/advisories/RUSTSEC-2022-0093) | `ed25519-dalek 1.0.1` | Not in the deployed program. The advisory is a **signing-side** oracle requiring the sign API with an attacker-influenced public key; this program never signs. |
 | [RUSTSEC-2024-0344](https://rustsec.org/advisories/RUSTSEC-2024-0344) | `curve25519-dalek 3.2.0` | Not in the deployed program. The advisory is a **timing side-channel**; an on-chain program processes no secrets — every input, account and execution step is public and deterministically replayable — so there is nothing for the channel to leak. |
 
+Worth stating precisely, because it is checkable: RUSTSEC-2024-0344's own
+remediation is *upgrade to >= 4.1.3*, and the program's normal dependency tree
+already resolves `curve25519-dalek 4.1.3`. Only the test harness's second copy
+sits at the affected 3.2.0.
+
 Both are genuine defects in general-purpose cryptographic libraries. Neither is
 reachable here, and neither is patchable from this repository: the versions are
 pinned by `agave-precompiles` via `litesvm`, not by anything under our control.
-They will clear when `litesvm` updates upstream.
+`cargo update -p litesvm` moves nothing, which is the check that confirms the
+pin is upstream rather than a stale lockfile here. They will clear when
+`litesvm` updates.
 
-GitHub's Dependabot reports these because it scans `Cargo.lock`, which records
-the complete graph including dev-dependencies and does not distinguish them. The
-badge is accurate about the lockfile and misleading about the program.
+### Unsoundness warning — `rand 0.7.3`
+
+| Advisory | Crate | Status |
+|---|---|---|
+| [RUSTSEC-2026-0097](https://rustsec.org/advisories/RUSTSEC-2026-0097) | `rand 0.7.3` | Not in the deployed program. The unsoundness requires a **custom global logger that calls `rand::rng()` reentrantly**; nothing in this crate installs a logger, and the affected version is reachable only from the test harness. |
+
+`cargo audit` classifies this one as *unsound* rather than *unmaintained*, so it
+is recorded here rather than in the maintenance list below — it is a soundness
+defect, not a maintenance note. It enters the graph twice, via
+`ed25519-dalek 1.0.1` and `libsecp256k1 0.6.0`, both of which sit beneath
+`agave-precompiles 3.1.14`, itself reached only through the `litesvm`
+`[dev-dependencies]` entry. The program's
+own tree resolves `rand 0.8.7`, which predates the `rand::rng()` API the
+advisory concerns.
 
 ### Unmaintained-crate warnings
 
-Six crates are flagged unmaintained or unsound: `ansi_term`, `bincode`,
-`derivative`, `libsecp256k1`, `paste`, and `rand 0.7.3`. These are advisories
-about maintenance status, not vulnerabilities, and all arrive transitively
-through the Solana and Anchor toolchains. They are listed here for completeness
-rather than presented as findings.
+Five crates are flagged unmaintained: `ansi_term`, `bincode`, `derivative`,
+`libsecp256k1`, and `paste`. These are advisories about maintenance status
+rather than defects, and all arrive transitively through the Solana and Anchor
+toolchains. They are listed for completeness rather than presented as findings.
+
+### Reconciling with GitHub's Dependabot
+
+Dependabot shows **three** open alerts where `cargo audit` shows two
+vulnerabilities: it surfaces the `rand` unsoundness alongside the two `*-dalek`
+advisories, and it does not separate the two classes. All three resolve to the
+same `litesvm` dev-dependency chain documented above. Dependabot reports them
+because it scans `Cargo.lock`, which records the complete graph including
+dev-dependencies without distinguishing them; the alert is accurate about the
+lockfile and misleading about the program. They are therefore dismissed in this
+repository as *vulnerable code is not actually used*, with this section as the
+standing justification.
 
 ### Reproduce
 
 ```sh
 cargo audit
-cargo tree -i curve25519-dalek@3.2.0
-cargo tree -i ed25519-dalek@1.0.1
+cargo tree -p spt_x402_escrow --edges normal | grep -E 'dalek|rand'
+cargo tree -p spt_x402_escrow -i curve25519-dalek@3.2.0
+cargo tree -p spt_x402_escrow -i ed25519-dalek@1.0.1
+cargo tree -p spt_x402_escrow -i rand@0.7.3
 ```
+
+The first tree is the program's real dependency graph, with dev-dependencies
+excluded. No affected version appears in it.
 
 ## Building
 
