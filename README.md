@@ -11,7 +11,7 @@ mismatch, stale freshness, or a replayed nonce all revert. This is the trustless
 settlement path that complements the off-chain gate in
 [spt-txn-x402-solana](https://github.com/rudizee007/spt-txn-x402-solana).
 
-- **Deployed on devnet:** [`C9kTmtYm5V8cFfNvgzJAcVfM2zYN1Pqv245Xe27h4NwZ`](https://explorer.solana.com/address/C9kTmtYm5V8cFfNvgzJAcVfM2zYN1Pqv245Xe27h4NwZ?cluster=devnet) — upgrade authority held by the deployer.
+- **Deployed on devnet:** [`C9kTmtYm5V8cFfNvgzJAcVfM2zYN1Pqv245Xe27h4NwZ`](https://explorer.solana.com/address/C9kTmtYm5V8cFfNvgzJAcVfM2zYN1Pqv245Xe27h4NwZ?cluster=devnet) — upgrade authority held by the deployer, issuer-allowlist admin held by a **different** key (the program refuses to let one key hold both).
 - Spec: [`docs/SPEC.md`](docs/SPEC.md) · Threat model: [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md)
 
 ## What it enforces on-chain
@@ -20,6 +20,9 @@ settlement path that complements the off-chain gate in
   introspection; the program verifies no signature itself.
 - **Issuer ∈ on-chain allowlist** — deny-by-default; nobody is authorized until
   explicitly added.
+- **Issuer == the key this payer pinned at deposit** — ANDed with the allowlist,
+  never substituted for it. The pin is immutable, so no admin action can make an
+  existing escrow releasable by a newly added key.
 - **Binding matches this payment** — payer, mint, amount, recipient, resource, and
   nonce, compared constant-time.
 - **Freshness** against the on-chain clock (short TTL).
@@ -33,6 +36,11 @@ settlement path that complements the off-chain gate in
   never released on a malformed or unauthorized request.
 - **No ambient authority.** Release requires the transaction-scoped proof, never a
   role or a network position.
+- **No operator holds custody.** The admin's entire power is to edit the issuer
+  allowlist and hand the role over. A fully compromised admin key cannot cause a
+  single unauthorized release — the worst it achieves is that in-flight escrows
+  expire and refund to their payers. Separation from the upgrade authority is an
+  account constraint, not a deploy note, and admin handover is two-step.
 - **No custom cryptography.** The Ed25519 precompile and `sha2` only; constant-time
   comparison for secret-adjacent bytes.
 - **Memory-safe trust boundary.** Rust / Anchor; no C or C++.
@@ -40,9 +48,13 @@ settlement path that complements the off-chain gate in
 ## Build & test
 
 ```sh
-anchor build
+cargo build-sbf --manifest-path programs/spt_x402_escrow/Cargo.toml
 cargo test -p spt_x402_escrow    # litesvm integration test
 ```
+
+**Do not run `anchor build`** — it rewrites `declare_id!` before compiling and
+produces a binary that bricks the deployed program. The reason is spelled out
+below.
 
 Requires the Anchor 1.1.2 / Solana 3.x / Rust 1.89 toolchain (see
 `rust-toolchain.toml`).

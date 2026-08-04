@@ -53,7 +53,10 @@ pub const MAX_ESCROW_SECS: i64 = 900; // 15 minutes
 pub const MAX_ISSUERS: usize = 16;
 
 // PDA seeds.
-pub const SEED_CONFIG: &[u8] = b"config";
+/// Versioned: the v1 Config account was created before `pending_admin` was
+/// added to the layout, and a program upgrade does not migrate account data.
+/// Bumping the seed derives a fresh PDA rather than deserializing stale bytes.
+pub const SEED_CONFIG: &[u8] = b"config-v2";
 pub const SEED_ESCROW: &[u8] = b"escrow";
 pub const SEED_VAULT: &[u8] = b"vault";
 /// Permanent single-use marker per binding (adversarial-review Finding 1).

@@ -25,11 +25,40 @@ pub mod spt_x402_escrow {
 
     /// One-time setup: create the Config with an admin and an EMPTY issuer
     /// allowlist (deny-by-default; nobody is authorized until explicitly added).
+    ///
+    /// The admin is NOT the signer. The upgrade authority signs — which is what
+    /// blocks the front-run — and *names* a different key as issuer admin. The
+    /// account constraints refuse to let one key hold both roles.
     pub fn init_config(ctx: Context<InitConfig>) -> Result<()> {
         let cfg = &mut ctx.accounts.config;
         cfg.admin = ctx.accounts.admin.key();
+        cfg.pending_admin = Pubkey::default();
         cfg.issuers = Vec::new();
         cfg.bump = ctx.bumps.config;
+        emit!(AdminChanged { previous: Pubkey::default(), current: cfg.admin });
+        Ok(())
+    }
+
+    /// Admin-only step 1 of 2: nominate a successor admin. Nothing changes yet —
+    /// the nominee must call `accept_admin`, which proves the key is real and held.
+    pub fn propose_admin(ctx: Context<AdminConfig>, new_admin: Pubkey) -> Result<()> {
+        require!(new_admin != Pubkey::default(), EscrowError::InvalidAdmin);
+        let cfg = &mut ctx.accounts.config;
+        cfg.pending_admin = new_admin;
+        emit!(AdminProposed { current: cfg.admin, nominee: new_admin });
+        Ok(())
+    }
+
+    /// Step 2 of 2: the nominee claims the role. The upgrade-authority separation
+    /// is re-checked here, so rotation cannot quietly collapse the two roles back
+    /// into one key months after deployment.
+    pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
+        let cfg = &mut ctx.accounts.config;
+        require!(cfg.pending_admin != Pubkey::default(), EscrowError::NoPendingAdmin);
+        let previous = cfg.admin;
+        cfg.admin = cfg.pending_admin;
+        cfg.pending_admin = Pubkey::default();
+        emit!(AdminChanged { previous, current: cfg.admin });
         Ok(())
     }
 
@@ -62,8 +91,17 @@ pub mod spt_x402_escrow {
         amount: u64,
         resource_id: [u8; 32],
         nonce: [u8; 32],
+        issuer: Pubkey,
     ) -> Result<()> {
         require!(amount > 0, EscrowError::InvalidAmount);
+
+        // Fail fast: refuse to escrow against an issuer nobody has authorized. The
+        // pin is what protects this escrow later; a garbage pin would make the
+        // deposit unreleasable and force the payer to sit out the expiry window.
+        require!(
+            ctx.accounts.config.is_authorized(&issuer),
+            EscrowError::IssuerNotAuthorized
+        );
 
         // Binding is instance-unique (payer + nonce), so the issuer attestation
         // that later releases this escrow cannot release any other (THREAT-MODEL T4).
@@ -84,6 +122,7 @@ pub mod spt_x402_escrow {
         escrow.recipient = ctx.accounts.recipient.key();
         escrow.mint = ctx.accounts.mint.key();
         escrow.amount = amount;
+        escrow.issuer = issuer;
         escrow.binding = binding;
         escrow.nonce = nonce;
         escrow.expiry_ts = expiry_ts;
@@ -114,8 +153,18 @@ pub mod spt_x402_escrow {
         // 1–2. Introspect the native Ed25519 precompile result: pubkey + message.
         let att = verify::find_and_verify_attestation(&ctx.accounts.instructions.to_account_info())?;
 
-        // 3. Issuer must be allowlisted (deny-by-default).
+        // 3. Issuer must be allowlisted (deny-by-default). Revocation is immediate
+        //    and applies to escrows already in flight.
         require!(cfg.is_authorized(&att.issuer), EscrowError::IssuerNotAuthorized);
+
+        // 3b. AND it must be the issuer this payer pinned at deposit. A compromised
+        //     admin can add a rogue issuer, but cannot reach any escrow that already
+        //     exists, because the pin is immutable and predates the compromise. The
+        //     two checks are ANDed, never substituted for one another (T9).
+        require!(
+            verify::ct_eq_32(&att.issuer.to_bytes(), &ctx.accounts.escrow.issuer.to_bytes()),
+            EscrowError::IssuerNotPinned
+        );
 
         // 4. Constant-time binding equality: does the signed payment == this escrow?
         require!(
@@ -217,21 +266,54 @@ pub mod spt_x402_escrow {
 #[derive(Accounts)]
 pub struct InitConfig<'info> {
     #[account(
-        init, payer = admin, space = Config::MAX_SIZE,
+        init, payer = upgrade_authority, space = Config::MAX_SIZE,
         seeds = [SEED_CONFIG], bump
     )]
     pub config: Account<'info, Config>,
+
+    /// The deployer. Must be the program's upgrade authority — that requirement is
+    /// what blocks the init_config front-run. It does NOT become the admin.
     #[account(mut)]
-    pub admin: Signer<'info>,
+    pub upgrade_authority: Signer<'info>,
+
+    /// The issuer-allowlist admin: recorded, not required to sign, and refused if
+    /// it is the upgrade authority. Separation of duties is enforced here rather
+    /// than asserted in deploy notes.
+    /// CHECK: stored as `Config.admin`; holds no authority over any vault or escrow.
+    #[account(
+        constraint = admin.key() != Pubkey::default() @ EscrowError::InvalidAdmin,
+        constraint = admin.key() != upgrade_authority.key() @ EscrowError::AdminIsUpgradeAuthority
+    )]
+    pub admin: UncheckedAccount<'info>,
+
     /// This program — ties `program_data` to us via its stored programdata address,
     /// so a foreign ProgramData can't be substituted (Finding 3).
     #[account(constraint = program.programdata_address()? == Some(program_data.key()) @ EscrowError::NotUpgradeAuthority)]
     pub program: Program<'info, crate::program::SptX402Escrow>,
-    /// The program's ProgramData — `admin` MUST be the upgrade authority. This
-    /// blocks the init_config front-run: only the deployer can set the admin.
-    #[account(constraint = program_data.upgrade_authority_address == Some(admin.key()) @ EscrowError::NotUpgradeAuthority)]
+    /// The program's ProgramData — the SIGNER must be the upgrade authority. This
+    /// blocks the init_config front-run: only the deployer can name the admin.
+    #[account(constraint = program_data.upgrade_authority_address == Some(upgrade_authority.key()) @ EscrowError::NotUpgradeAuthority)]
     pub program_data: Account<'info, ProgramData>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AcceptAdmin<'info> {
+    #[account(mut, seeds = [SEED_CONFIG], bump = config.bump)]
+    pub config: Account<'info, Config>,
+
+    /// The nominee from `propose_admin`, proving control by signing.
+    #[account(constraint = new_admin.key() == config.pending_admin @ EscrowError::NoPendingAdmin)]
+    pub new_admin: Signer<'info>,
+
+    /// CHECK: see InitConfig — binds `program_data` to this program.
+    #[account(constraint = program.programdata_address()? == Some(program_data.key()) @ EscrowError::NotUpgradeAuthority)]
+    pub program: Program<'info, crate::program::SptX402Escrow>,
+    /// Re-asserts separation of duties at rotation time: the incoming admin must
+    /// not be the current upgrade authority. Checking only at `init_config` would
+    /// let the invariant lapse the first time the role is handed over.
+    #[account(constraint = program_data.upgrade_authority_address != Some(new_admin.key()) @ EscrowError::AdminIsUpgradeAuthority)]
+    pub program_data: Account<'info, ProgramData>,
 }
 
 #[derive(Accounts)]
@@ -242,10 +324,15 @@ pub struct AdminConfig<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(amount: u64, resource_id: [u8; 32], nonce: [u8; 32])]
+#[instruction(amount: u64, resource_id: [u8; 32], nonce: [u8; 32], issuer: Pubkey)]
 pub struct InitEscrow<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
+
+    /// Read-only: used to reject a pin that is not currently an authorized issuer.
+    #[account(seeds = [SEED_CONFIG], bump = config.bump)]
+    pub config: Account<'info, Config>,
+
     /// CHECK: recipient is bound into the escrow + binding; not required to sign.
     pub recipient: UncheckedAccount<'info>,
     pub mint: Account<'info, Mint>,
@@ -348,6 +435,10 @@ pub struct RefundExpired<'info> {
 
 // ───────────────────────────────── Events ──────────────────────────────────
 
+#[event]
+pub struct AdminProposed { pub current: Pubkey, pub nominee: Pubkey }
+#[event]
+pub struct AdminChanged { pub previous: Pubkey, pub current: Pubkey }
 #[event]
 pub struct IssuerAdded { pub issuer: Pubkey }
 #[event]

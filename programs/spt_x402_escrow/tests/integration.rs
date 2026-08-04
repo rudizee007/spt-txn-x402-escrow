@@ -1,9 +1,10 @@
 //! litesvm end-to-end integration test. Proves at runtime what the unit tests
 //! prove in logic: the full escrow lifecycle works, the Ed25519 sysvar
-//! introspection finds and binds the attestation, and a replayed attestation is
-//! rejected by the permanent spent-marker (adversarial-review Finding 1).
+//! introspection finds and binds the attestation, a replayed attestation is
+//! rejected by the permanent spent-marker (adversarial-review Finding 1), and a
+//! fully compromised admin cannot cause a release (THREAT-MODEL T9).
 //!
-//! Requires the built program: run `anchor build` first, then `cargo test`.
+//! Requires the built program: run `cargo build-sbf` first, then `cargo test`.
 //! SPL token accounts are injected directly (set_account) to keep the harness
 //! dependency-light; the program still creates the vault via a real CPI.
 
@@ -19,21 +20,13 @@ use {
     solana_message::{Message, VersionedMessage},
     solana_signer::Signer,
     solana_transaction::versioned::VersionedTransaction,
-    spt_x402_escrow::{constants::*, verify::compute_binding},
+    spt_x402_escrow::{constants::*, errors::EscrowError, verify::compute_binding},
 };
 
 const SPL_TOKEN_ID: Pubkey = Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const RENT_SYSVAR_ID: Pubkey = Pubkey::from_str_const("SysvarRent111111111111111111111111111111111");
 const BPF_LOADER_UPGRADEABLE_ID: Pubkey = Pubkey::from_str_const("BPFLoaderUpgradeab1e11111111111111111111111");
 const AMOUNT: u64 = 1_000_000;
-
-fn load_svm() -> (LiteSVM, Pubkey) {
-    let program_id = spt_x402_escrow::id();
-    let mut svm = LiteSVM::new();
-    let bytes = include_bytes!(concat!(env!("CARGO_TARGET_TMPDIR"), "/../deploy/spt_x402_escrow.so"));
-    svm.add_program(program_id, bytes).unwrap();
-    (svm, program_id)
-}
 
 // ── SPL account byte layouts (Token program) ────────────────────────────────
 fn spl_mint_data(mint_authority: &Pubkey, supply: u64, decimals: u8) -> Vec<u8> {
@@ -109,10 +102,76 @@ fn send(svm: &mut LiteSVM, ixs: &[Instruction], payer: &Keypair, signers: &[&Key
     }
 }
 
-#[test]
-fn happy_path_then_replay_blocked() {
-    let (mut svm, program_id) = load_svm();
+/// Assert a transaction failed *for the stated reason*. A bare `!send(..)` also
+/// passes when the tx failed on a missing account or a stale blockhash — which is
+/// how a negative test quietly stops testing the thing it is named after.
+fn send_expecting(
+    svm: &mut LiteSVM,
+    ixs: &[Instruction],
+    payer: &Keypair,
+    signers: &[&Keypair],
+    err: EscrowError,
+) -> bool {
+    let name = format!("{:?}", err);
+    let code = err as u32 + anchor_lang::error::ERROR_CODE_OFFSET;
 
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    let msg = Message::new_with_blockhash(ixs, Some(&payer.pubkey()), &bh);
+    let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), signers).unwrap();
+    match svm.send_transaction(tx) {
+        Ok(_) => {
+            eprintln!("  EXPECTED FAILURE {} ({}), GOT SUCCESS", name, code);
+            false
+        }
+        Err(e) => {
+            // The error struct prints the code in decimal; the program logs print it
+            // in hex. Accept either so this does not break on a formatting change.
+            let dec = format!("Custom({})", code);
+            let hex = format!("0x{:x}", code);
+            let hit = format!("{:?}", e.err).contains(&dec)
+                || e.meta.logs.iter().any(|l| l.contains(&hex) || l.contains(&dec));
+            if !hit {
+                eprintln!("  WRONG FAILURE: wanted {} ({} / {}), got {:?}", name, dec, hex, e.err);
+                for l in &e.meta.logs {
+                    eprintln!("  LOG: {}", l);
+                }
+            }
+            hit
+        }
+    }
+}
+
+// ── shared fixture ──────────────────────────────────────────────────────────
+
+/// Everything a test needs. `upgrade_authority` and `admin` are deliberately
+/// distinct keys — the program now refuses to let one key hold both roles.
+struct Fx {
+    svm: LiteSVM,
+    program_id: Pubkey,
+    upgrade_authority: Keypair,
+    admin: Keypair,
+    payer: Keypair,
+    releaser: Keypair,
+    issuer: Keypair,
+    recipient: Pubkey,
+    mint: Pubkey,
+    payer_ata: Pubkey,
+    recipient_ata: Pubkey,
+    config: Pubkey,
+    program_data: Pubkey,
+}
+
+/// Loads the program, funds the keys, injects SPL accounts, and patches the
+/// ProgramData record so `upgrade_authority` really is the upgrade authority.
+/// Does NOT run init_config — the init_config tests need it unset.
+fn base() -> Fx {
+    let program_id = spt_x402_escrow::id();
+    let mut svm = LiteSVM::new();
+    let bytes = include_bytes!(concat!(env!("CARGO_TARGET_TMPDIR"), "/../deploy/spt_x402_escrow.so"));
+    svm.add_program(program_id, bytes).unwrap();
+
+    let upgrade_authority = Keypair::new();
     let admin = Keypair::new();
     let payer = Keypair::new();
     let releaser = Keypair::new();
@@ -122,7 +181,7 @@ fn happy_path_then_replay_blocked() {
     let payer_ata = Keypair::new().pubkey();
     let recipient_ata = Keypair::new().pubkey();
 
-    for kp in [&admin, &payer, &releaser] {
+    for kp in [&upgrade_authority, &admin, &payer, &releaser] {
         svm.airdrop(&kp.pubkey(), 1_000_000_000).unwrap();
     }
     inject(&mut svm, &mint, &SPL_TOKEN_ID, spl_mint_data(&admin.pubkey(), AMOUNT, 0));
@@ -131,116 +190,399 @@ fn happy_path_then_replay_blocked() {
 
     let (config, _) = Pubkey::find_program_address(&[SEED_CONFIG], &program_id);
 
-    // Finding 3: make `admin` the program's upgrade authority so init_config's gate
-    // passes. litesvm loads the program with upgrade_authority = None, so patch the
-    // ProgramData metadata: [0..4]=variant(3=ProgramData), [4..12]=slot,
+    // Finding 3: litesvm loads the program with upgrade_authority = None, so patch
+    // the ProgramData metadata: [0..4]=variant(3=ProgramData), [4..12]=slot,
     // [12]=Option tag(1=Some), [13..45]=authority pubkey.
     let (program_data, _) = Pubkey::find_program_address(&[program_id.as_ref()], &BPF_LOADER_UPGRADEABLE_ID);
     let mut pd = svm.get_account(&program_data).unwrap();
     pd.data[0..4].copy_from_slice(&3u32.to_le_bytes());
     pd.data[12] = 1;
-    pd.data[13..45].copy_from_slice(admin.pubkey().as_ref());
+    pd.data[13..45].copy_from_slice(upgrade_authority.pubkey().as_ref());
     svm.set_account(program_data, pd).unwrap();
 
-    // 1. init_config (gated to the upgrade authority)
-    let ix = Instruction::new_with_bytes(
-        program_id,
-        &spt_x402_escrow::instruction::InitConfig {}.data(),
-        spt_x402_escrow::accounts::InitConfig {
-            config,
-            admin: admin.pubkey(),
-            program: program_id,
-            program_data,
-            system_program: system_program::ID,
-        }
-        .to_account_metas(None),
-    );
-    assert!(send(&mut svm, &[ix], &admin, &[&admin]), "init_config failed");
+    Fx {
+        svm, program_id, upgrade_authority, admin, payer, releaser, issuer,
+        recipient, mint, payer_ata, recipient_ata, config, program_data,
+    }
+}
 
-    // 2. add_issuer(issuer)
-    let ix = Instruction::new_with_bytes(
-        program_id,
-        &spt_x402_escrow::instruction::AddIssuer { issuer: issuer.pubkey() }.data(),
-        spt_x402_escrow::accounts::AdminConfig { config, admin: admin.pubkey() }.to_account_metas(None),
+/// base() + init_config(admin) + add_issuer(issuer). The common starting point.
+fn bootstrapped() -> Fx {
+    let mut fx = base();
+    let ix = fx.init_config_ix(fx.admin.pubkey());
+    assert!(
+        send(&mut fx.svm, &[ix], &fx.upgrade_authority, &[&fx.upgrade_authority]),
+        "init_config failed"
     );
-    assert!(send(&mut svm, &[ix], &admin, &[&admin]), "add_issuer failed");
+    let ix = fx.add_issuer_ix(fx.admin.pubkey(), fx.issuer.pubkey());
+    assert!(send(&mut fx.svm, &[ix], &fx.admin, &[&fx.admin]), "add_issuer failed");
+    fx
+}
 
-    // Escrow parameters + binding (instance-unique via payer + nonce).
-    let resource_id = [0x44u8; 32];
-    let nonce = [0x55u8; 32];
-    let binding = compute_binding(&payer.pubkey(), &mint, AMOUNT, &recipient, &resource_id, &nonce);
-    let (escrow, _) = Pubkey::find_program_address(
-        &[SEED_ESCROW, payer.pubkey().as_ref(), recipient.as_ref(), &binding],
-        &program_id,
-    );
-    let (vault, _) = Pubkey::find_program_address(&[SEED_VAULT, escrow.as_ref()], &program_id);
-    let (spent, _) = Pubkey::find_program_address(&[SEED_SPENT, &binding], &program_id);
-
-    // 3. init_escrow — deposits AMOUNT into the program-owned vault.
-    let init_escrow_ix = || {
+impl Fx {
+    /// init_config: the UPGRADE AUTHORITY signs (blocking the front-run) and names
+    /// a separate `admin`. The admin never signs here.
+    fn init_config_ix(&self, admin: Pubkey) -> Instruction {
         Instruction::new_with_bytes(
-            program_id,
-            &spt_x402_escrow::instruction::InitEscrow { amount: AMOUNT, resource_id, nonce }.data(),
+            self.program_id,
+            &spt_x402_escrow::instruction::InitConfig {}.data(),
+            spt_x402_escrow::accounts::InitConfig {
+                config: self.config,
+                upgrade_authority: self.upgrade_authority.pubkey(),
+                admin,
+                program: self.program_id,
+                program_data: self.program_data,
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+        )
+    }
+
+    fn add_issuer_ix(&self, admin: Pubkey, issuer: Pubkey) -> Instruction {
+        Instruction::new_with_bytes(
+            self.program_id,
+            &spt_x402_escrow::instruction::AddIssuer { issuer }.data(),
+            spt_x402_escrow::accounts::AdminConfig { config: self.config, admin }.to_account_metas(None),
+        )
+    }
+
+    fn remove_issuer_ix(&self, admin: Pubkey, issuer: Pubkey) -> Instruction {
+        Instruction::new_with_bytes(
+            self.program_id,
+            &spt_x402_escrow::instruction::RemoveIssuer { issuer }.data(),
+            spt_x402_escrow::accounts::AdminConfig { config: self.config, admin }.to_account_metas(None),
+        )
+    }
+
+    fn propose_admin_ix(&self, admin: Pubkey, new_admin: Pubkey) -> Instruction {
+        Instruction::new_with_bytes(
+            self.program_id,
+            &spt_x402_escrow::instruction::ProposeAdmin { new_admin }.data(),
+            spt_x402_escrow::accounts::AdminConfig { config: self.config, admin }.to_account_metas(None),
+        )
+    }
+
+    fn accept_admin_ix(&self, new_admin: Pubkey) -> Instruction {
+        Instruction::new_with_bytes(
+            self.program_id,
+            &spt_x402_escrow::instruction::AcceptAdmin {}.data(),
+            spt_x402_escrow::accounts::AcceptAdmin {
+                config: self.config,
+                new_admin,
+                program: self.program_id,
+                program_data: self.program_data,
+            }
+            .to_account_metas(None),
+        )
+    }
+
+    /// `issuer` here is the PIN written into the escrow — the only key whose
+    /// attestation can ever release it.
+    fn init_escrow_ix(
+        &self,
+        issuer: Pubkey,
+        resource_id: [u8; 32],
+        nonce: [u8; 32],
+        escrow: Pubkey,
+        vault: Pubkey,
+    ) -> Instruction {
+        Instruction::new_with_bytes(
+            self.program_id,
+            &spt_x402_escrow::instruction::InitEscrow { amount: AMOUNT, resource_id, nonce, issuer }.data(),
             spt_x402_escrow::accounts::InitEscrow {
-                payer: payer.pubkey(),
-                recipient,
-                mint,
+                payer: self.payer.pubkey(),
+                config: self.config,
+                recipient: self.recipient,
+                mint: self.mint,
                 escrow,
                 vault,
-                payer_ata,
+                payer_ata: self.payer_ata,
                 token_program: SPL_TOKEN_ID,
                 system_program: system_program::ID,
                 rent: RENT_SYSVAR_ID,
             }
             .to_account_metas(None),
         )
-    };
-    assert!(send(&mut svm, &[init_escrow_ix()], &payer, &[&payer]), "init_escrow failed");
+    }
 
-    // Build the issuer attestation over the fixed token_msg. iat must track the
-    // VM clock so the freshness check (±MAX_TOKEN_AGE_SECS) passes at runtime.
-    let clock: anchor_lang::prelude::Clock = svm.get_sysvar();
-    let iat = clock.unix_timestamp;
-    let token_msg = build_token_msg(&binding, iat);
-    let issuer_pk: [u8; 32] = issuer.pubkey().to_bytes();
-    let sig: [u8; 64] = <[u8; 64]>::try_from(issuer.sign_message(&token_msg).as_ref()).unwrap();
-    let ed_ix = build_ed25519_ix(&issuer_pk, &sig, &token_msg);
-
-    let release_ix = || {
+    fn release_ix(&self, escrow: Pubkey, vault: Pubkey, spent: Pubkey) -> Instruction {
         Instruction::new_with_bytes(
-            program_id,
+            self.program_id,
             &spt_x402_escrow::instruction::ReleaseWithProof {}.data(),
             spt_x402_escrow::accounts::ReleaseWithProof {
-                config,
+                config: self.config,
                 escrow,
                 vault,
-                recipient_ata,
-                payer_refund: payer.pubkey(),
+                recipient_ata: self.recipient_ata,
+                payer_refund: self.payer.pubkey(),
                 instructions: INSTRUCTIONS_SYSVAR_ID,
-                releaser: releaser.pubkey(),
+                releaser: self.releaser.pubkey(),
                 spent_marker: spent,
                 token_program: SPL_TOKEN_ID,
                 system_program: system_program::ID,
             }
             .to_account_metas(None),
         )
-    };
+    }
 
-    // 4. release_with_proof — Ed25519 ix must precede the release ix.
+    /// Derive the binding and the escrow/vault/spent PDAs for one payment.
+    fn derive(&self, resource_id: &[u8; 32], nonce: &[u8; 32]) -> ([u8; 32], Pubkey, Pubkey, Pubkey) {
+        let binding =
+            compute_binding(&self.payer.pubkey(), &self.mint, AMOUNT, &self.recipient, resource_id, nonce);
+        let (escrow, _) = Pubkey::find_program_address(
+            &[SEED_ESCROW, self.payer.pubkey().as_ref(), self.recipient.as_ref(), &binding],
+            &self.program_id,
+        );
+        let (vault, _) = Pubkey::find_program_address(&[SEED_VAULT, escrow.as_ref()], &self.program_id);
+        let (spent, _) = Pubkey::find_program_address(&[SEED_SPENT, &binding], &self.program_id);
+        (binding, escrow, vault, spent)
+    }
+
+    /// A real Ed25519 attestation over `binding`, signed by `signer`, fresh now.
+    fn attestation_ix(&self, binding: &[u8; 32], signer: &Keypair) -> Instruction {
+        let clock: anchor_lang::prelude::Clock = self.svm.get_sysvar();
+        let token_msg = build_token_msg(binding, clock.unix_timestamp);
+        let pk: [u8; 32] = signer.pubkey().to_bytes();
+        let sig: [u8; 64] = <[u8; 64]>::try_from(signer.sign_message(&token_msg).as_ref()).unwrap();
+        build_ed25519_ix(&pk, &sig, &token_msg)
+    }
+}
+
+// ── tests ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn happy_path_then_replay_blocked() {
+    let mut fx = bootstrapped();
+
+    let resource_id = [0x44u8; 32];
+    let nonce = [0x55u8; 32];
+    let (binding, escrow, vault, spent) = fx.derive(&resource_id, &nonce);
+
+    // init_escrow — deposits AMOUNT into the program-owned vault, pinned to issuer.
+    let init_ix = fx.init_escrow_ix(fx.issuer.pubkey(), resource_id, nonce, escrow, vault);
+    assert!(send(&mut fx.svm, &[init_ix.clone()], &fx.payer, &[&fx.payer]), "init_escrow failed");
+
+    let ed_ix = fx.attestation_ix(&binding, &fx.issuer);
+    let rel_ix = fx.release_ix(escrow, vault, spent);
+
+    // release_with_proof — the Ed25519 ix must precede the release ix.
     assert!(
-        send(&mut svm, &[ed_ix.clone(), release_ix()], &releaser, &[&releaser]),
+        send(&mut fx.svm, &[ed_ix.clone(), rel_ix.clone()], &fx.releaser, &[&fx.releaser]),
         "release_with_proof failed"
     );
-    assert_eq!(token_amount(&svm, &recipient_ata), AMOUNT, "recipient was not paid");
-    assert!(svm.get_account(&escrow).map_or(true, |a| a.data.is_empty()), "escrow not closed");
-    assert!(svm.get_account(&spent).is_some(), "spent-marker not created");
+    assert_eq!(token_amount(&fx.svm, &fx.recipient_ata), AMOUNT, "recipient was not paid");
+    assert!(fx.svm.get_account(&escrow).map_or(true, |a| a.data.is_empty()), "escrow not closed");
+    assert!(fx.svm.get_account(&spent).is_some(), "spent-marker not created");
 
-    // 5. REPLAY: re-fund and re-create the same escrow (same nonce), then replay
-    //    the identical attestation. Must FAIL at the spent-marker init.
-    inject(&mut svm, &payer_ata, &SPL_TOKEN_ID, spl_token_account_data(&mint, &payer.pubkey(), AMOUNT));
-    assert!(send(&mut svm, &[init_escrow_ix()], &payer, &[&payer]), "escrow re-init failed");
+    // REPLAY: re-fund and re-create the same escrow (same nonce), then replay the
+    // identical attestation. Must FAIL at the spent-marker init.
+    let (mint, payer_ata, payer_pk) = (fx.mint, fx.payer_ata, fx.payer.pubkey());
+    inject(&mut fx.svm, &payer_ata, &SPL_TOKEN_ID, spl_token_account_data(&mint, &payer_pk, AMOUNT));
+    assert!(send(&mut fx.svm, &[init_ix], &fx.payer, &[&fx.payer]), "escrow re-init failed");
     assert!(
-        !send(&mut svm, &[ed_ix, release_ix()], &releaser, &[&releaser]),
+        !send(&mut fx.svm, &[ed_ix, rel_ix], &fx.releaser, &[&fx.releaser]),
         "REPLAY WAS ACCEPTED — spent-marker did not block a captured attestation (Finding 1 regressed)"
+    );
+}
+
+/// THREAT-MODEL T9, the property this hardening exists for: a FULLY COMPROMISED
+/// ADMIN cannot cause an unauthorized release. The attacker holds the admin key,
+/// adds an issuer they control, and signs a valid, fresh, correctly-bound
+/// attestation. It is still refused, because the escrow pinned a different issuer
+/// at deposit and the pin is immutable.
+#[test]
+fn compromised_admin_cannot_release_a_pinned_escrow() {
+    let mut fx = bootstrapped();
+
+    let resource_id = [0x11u8; 32];
+    let nonce = [0x22u8; 32];
+    let (binding, escrow, vault, spent) = fx.derive(&resource_id, &nonce);
+
+    // Payer deposits, pinning the honest issuer.
+    let init_ix = fx.init_escrow_ix(fx.issuer.pubkey(), resource_id, nonce, escrow, vault);
+    assert!(send(&mut fx.svm, &[init_ix], &fx.payer, &[&fx.payer]), "init_escrow failed");
+
+    // ── the admin key is now in the attacker's hands ──
+    let rogue = Keypair::new();
+    let ix = fx.add_issuer_ix(fx.admin.pubkey(), rogue.pubkey());
+    assert!(send(&mut fx.svm, &[ix], &fx.admin, &[&fx.admin]), "add_issuer(rogue) failed");
+
+    // The rogue issuer IS allowlisted, and its attestation IS cryptographically
+    // valid and correctly bound to this exact escrow. Only the pin stands in the way.
+    let ed_ix = fx.attestation_ix(&binding, &rogue);
+    let rel_ix = fx.release_ix(escrow, vault, spent);
+    assert!(
+        send_expecting(
+            &mut fx.svm,
+            &[ed_ix, rel_ix],
+            &fx.releaser,
+            &[&fx.releaser],
+            EscrowError::IssuerNotPinned,
+        ),
+        "COMPROMISED ADMIN RELEASED FUNDS — issuer pinning regressed (T9)"
+    );
+    assert_eq!(token_amount(&fx.svm, &fx.recipient_ata), 0, "recipient was paid by a rogue issuer");
+    assert!(fx.svm.get_account(&spent).map_or(true, |a| a.data.is_empty()), "spent-marker was created");
+}
+
+/// Revocation must still bite escrows already in flight: pinning is ANDed with the
+/// allowlist, it does not replace it. A second issuer stays on the list so this
+/// exercises the per-issuer check rather than the empty-allowlist guard.
+#[test]
+fn revoked_issuer_cannot_release_even_when_pinned() {
+    let mut fx = bootstrapped();
+
+    let decoy = Keypair::new().pubkey();
+    let ix = fx.add_issuer_ix(fx.admin.pubkey(), decoy);
+    assert!(send(&mut fx.svm, &[ix], &fx.admin, &[&fx.admin]), "add_issuer(decoy) failed");
+
+    let resource_id = [0x33u8; 32];
+    let nonce = [0x66u8; 32];
+    let (binding, escrow, vault, spent) = fx.derive(&resource_id, &nonce);
+
+    let init_ix = fx.init_escrow_ix(fx.issuer.pubkey(), resource_id, nonce, escrow, vault);
+    assert!(send(&mut fx.svm, &[init_ix], &fx.payer, &[&fx.payer]), "init_escrow failed");
+
+    // Issuer compromise detected → the admin revokes it mid-flight.
+    let ix = fx.remove_issuer_ix(fx.admin.pubkey(), fx.issuer.pubkey());
+    assert!(send(&mut fx.svm, &[ix], &fx.admin, &[&fx.admin]), "remove_issuer failed");
+
+    let ed_ix = fx.attestation_ix(&binding, &fx.issuer);
+    let rel_ix = fx.release_ix(escrow, vault, spent);
+    assert!(
+        send_expecting(
+            &mut fx.svm,
+            &[ed_ix, rel_ix],
+            &fx.releaser,
+            &[&fx.releaser],
+            EscrowError::IssuerNotAuthorized,
+        ),
+        "REVOKED ISSUER RELEASED FUNDS — pinning must AND with the allowlist, not replace it"
+    );
+    assert_eq!(token_amount(&fx.svm, &fx.recipient_ata), 0, "recipient was paid by a revoked issuer");
+}
+
+/// A payer cannot pin an issuer nobody authorized: the deposit is refused up front
+/// rather than becoming an unreleasable escrow that has to wait out expiry.
+#[test]
+fn cannot_pin_an_unauthorized_issuer() {
+    let mut fx = bootstrapped();
+
+    let resource_id = [0x77u8; 32];
+    let nonce = [0x88u8; 32];
+    let (_binding, escrow, vault, _spent) = fx.derive(&resource_id, &nonce);
+
+    let stranger = Keypair::new().pubkey();
+    let init_ix = fx.init_escrow_ix(stranger, resource_id, nonce, escrow, vault);
+    assert!(
+        send_expecting(&mut fx.svm, &[init_ix], &fx.payer, &[&fx.payer], EscrowError::IssuerNotAuthorized),
+        "escrow accepted a pin for an unauthorized issuer"
+    );
+}
+
+/// Separation of duties is a runtime constraint, not a deploy convention:
+/// init_config refuses to record the upgrade authority as the admin.
+#[test]
+fn init_config_refuses_to_collapse_the_two_roles() {
+    let mut fx = base();
+    let ua_pk = fx.upgrade_authority.pubkey();
+    let ix = fx.init_config_ix(ua_pk);
+    assert!(
+        send_expecting(
+            &mut fx.svm,
+            &[ix],
+            &fx.upgrade_authority,
+            &[&fx.upgrade_authority],
+            EscrowError::AdminIsUpgradeAuthority,
+        ),
+        "init_config allowed one key to hold both the upgrade authority and the admin role"
+    );
+}
+
+/// The front-run defence: someone who is not the upgrade authority cannot get in
+/// first and name themselves admin.
+#[test]
+fn init_config_rejects_a_non_upgrade_authority_signer() {
+    let mut fx = base();
+    let attacker = Keypair::new();
+    fx.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+
+    let ix = Instruction::new_with_bytes(
+        fx.program_id,
+        &spt_x402_escrow::instruction::InitConfig {}.data(),
+        spt_x402_escrow::accounts::InitConfig {
+            config: fx.config,
+            upgrade_authority: attacker.pubkey(),
+            admin: Keypair::new().pubkey(),
+            program: fx.program_id,
+            program_data: fx.program_data,
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+    );
+    assert!(
+        send_expecting(&mut fx.svm, &[ix], &attacker, &[&attacker], EscrowError::NotUpgradeAuthority),
+        "init_config was front-runnable by a non-upgrade-authority signer"
+    );
+}
+
+/// Two-step admin rotation: propose, then accept. A nominee that never accepts
+/// changes nothing, and the outgoing admin keeps working until handover completes.
+#[test]
+fn admin_rotation_is_two_step_and_transfers_the_role() {
+    let mut fx = bootstrapped();
+    let new_admin = Keypair::new();
+    fx.svm.airdrop(&new_admin.pubkey(), 1_000_000_000).unwrap();
+
+    let ix = fx.propose_admin_ix(fx.admin.pubkey(), new_admin.pubkey());
+    assert!(send(&mut fx.svm, &[ix], &fx.admin, &[&fx.admin]), "propose_admin failed");
+
+    // The old admin still holds the role until the nominee accepts.
+    let ix = fx.add_issuer_ix(fx.admin.pubkey(), Keypair::new().pubkey());
+    assert!(send(&mut fx.svm, &[ix], &fx.admin, &[&fx.admin]), "old admin lost the role before handover");
+
+    // A third party cannot accept in the nominee's place.
+    let interloper = Keypair::new();
+    fx.svm.airdrop(&interloper.pubkey(), 1_000_000_000).unwrap();
+    let ix = fx.accept_admin_ix(interloper.pubkey());
+    assert!(
+        send_expecting(&mut fx.svm, &[ix], &interloper, &[&interloper], EscrowError::NoPendingAdmin),
+        "a non-nominee accepted the admin role"
+    );
+
+    // The nominee accepts — the role transfers.
+    let ix = fx.accept_admin_ix(new_admin.pubkey());
+    assert!(send(&mut fx.svm, &[ix], &new_admin, &[&new_admin]), "accept_admin failed");
+
+    let ix = fx.add_issuer_ix(new_admin.pubkey(), Keypair::new().pubkey());
+    assert!(send(&mut fx.svm, &[ix], &new_admin, &[&new_admin]), "new admin cannot add an issuer");
+
+    let ix = fx.add_issuer_ix(fx.admin.pubkey(), Keypair::new().pubkey());
+    assert!(
+        !send(&mut fx.svm, &[ix], &fx.admin, &[&fx.admin]),
+        "OLD ADMIN STILL HOLDS THE ROLE after handover"
+    );
+}
+
+/// Rotation cannot quietly re-collapse the roles: handing the admin seat to the
+/// upgrade authority is refused at accept time, not only at init.
+#[test]
+fn admin_rotation_refuses_the_upgrade_authority() {
+    let mut fx = bootstrapped();
+    let ua_pk = fx.upgrade_authority.pubkey();
+
+    let ix = fx.propose_admin_ix(fx.admin.pubkey(), ua_pk);
+    assert!(send(&mut fx.svm, &[ix], &fx.admin, &[&fx.admin]), "propose_admin failed");
+
+    let ix = fx.accept_admin_ix(ua_pk);
+    assert!(
+        send_expecting(
+            &mut fx.svm,
+            &[ix],
+            &fx.upgrade_authority,
+            &[&fx.upgrade_authority],
+            EscrowError::AdminIsUpgradeAuthority,
+        ),
+        "rotation collapsed the upgrade authority and admin into one key"
     );
 }

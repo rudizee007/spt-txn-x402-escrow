@@ -23,6 +23,8 @@ pub enum EscrowError {
     AttestationExpired,
     #[msg("VIOLATION: escrow has passed its expiry; release is no longer allowed")]
     EscrowExpired,
+    #[msg("VIOLATION: attestation issuer is not the issuer pinned to this escrow")]
+    IssuerNotPinned,
 
     // ── DENY_UNAVAILABLE: environment/config fault, not an authorization result
     #[msg("UNAVAILABLE: issuer allowlist is not initialized")]
@@ -43,4 +45,10 @@ pub enum EscrowError {
     InvalidAmount,
     #[msg("VIOLATION: init_config signer is not the program upgrade authority")]
     NotUpgradeAuthority,
+    #[msg("admin must not be the program upgrade authority: the roles are held separately")]
+    AdminIsUpgradeAuthority,
+    #[msg("admin must not be the default pubkey")]
+    InvalidAdmin,
+    #[msg("no admin handover is pending, or the signer is not the pending admin")]
+    NoPendingAdmin,
 }

@@ -23,3 +23,6 @@ dist/
 
 # Dumped on-chain program bytes (verification scratch)
 onchain.so
+
+# strays awaiting manual removal
+_to_delete/

@@ -11,7 +11,7 @@ Machine-readable contact details are in [`security.json`](security.json).
 `spt_x402_escrow` holds funds in a vault PDA and releases them only against an
 Ed25519 attestation, issued by an allow-listed key, bound to that exact escrow.
 
-Three properties carry the weight:
+Four properties carry the weight:
 
 **The program holds no key material.** There is no secret in the program, in any
 account it owns, or in the deployed binary. Signing happens off-chain; the
@@ -29,6 +29,20 @@ the allowlist **empty**, in its own transaction. Issuers are authorized
 separately by `add_issuer`, which requires the recorded admin. `init_config`
 itself refuses any signer that is not the program's recorded upgrade authority,
 which closes the config front-run.
+
+**No operator role can cause a release.** At deposit the payer names the one
+issuer key permitted to release that escrow, and the program stores it
+immutably. Release requires the attesting key to equal that pin **and** to be on
+the allowlist — both, never either. Since no instruction can edit a stored pin,
+an attacker holding the admin key can add an issuer they control and still not
+release a single existing escrow; the worst they achieve is refusing new
+releases, after which `refund_expired` returns every payer's funds to the payer.
+Separation of duties is enforced by the account constraints rather than by
+deploy notes: `init_config` has the upgrade authority sign while naming a
+*different* key as admin, and the same check runs again at `accept_admin` so a
+later rotation cannot re-merge the roles. Admin handover is two-step — nominate,
+then the nominee signs to claim it. See [`THREAT-MODEL.md`](THREAT-MODEL.md) T9
+and [`SPEC.md`](SPEC.md) §5.4.
 
 ## Dependency audit status
 

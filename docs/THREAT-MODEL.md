@@ -35,9 +35,13 @@ instruction was present.*
 
 ## T3 — Wrong / rogue issuer (HIGH)
 *Attacker signs a token with their own Ed25519 key.*
-- **Mitigation:** deny-by-default `IssuerAllowlist` set at program init by an admin
-  PDA. Signer ∉ allowlist → DENY_VIOLATION. Allowlist changes are admin-gated and
-  logged. Empty/uninitialized allowlist → DENY_UNAVAILABLE (never allow-all).
+- **Mitigation:** deny-by-default `IssuerAllowlist`, admin-gated and logged.
+  Signer ∉ allowlist → DENY_VIOLATION. Empty/uninitialized allowlist →
+  DENY_UNAVAILABLE (never allow-all).
+- **Second, independent gate:** allowlist membership is necessary but not
+  sufficient. The signer must also equal the issuer the payer pinned at deposit.
+  An attacker who obtains allowlist membership — including by compromising the
+  admin — still cannot release an escrow pinned to someone else. See T9.
 
 ## T4 — Replay of a valid release (HIGH)
 *Attacker replays a previously valid `release_with_proof`.*
@@ -85,12 +89,53 @@ instruction was present.*
   `None`). SPL transfers via CPI to the token program with `mint` and `owner`
   constraints; vault is a PDA-owned ATA. No raw lamport math on SPL paths.
 
-## T9 — Admin/allowlist compromise (MEDIUM, governance)
-*Admin key rotates in a rogue issuer.*
-- **Mitigation:** admin is a PDA with a documented, separately-held upgrade
-  authority; allowlist changes emit events for the transparency log. Out-of-band
-  monitoring. (Program-upgrade authority governance is documented in deploy notes,
-  not code.)
+## T9 — Admin/allowlist compromise (LOW residual, structurally mitigated)
+*The admin key is stolen and the attacker allowlists an issuer they control.*
+
+This is the strongest custody objection anyone can raise against the design, so
+it is answered structurally rather than procedurally: **a fully compromised admin
+key cannot cause a single unauthorized release.**
+
+- **Mitigation — issuer pinning, ANDed with the allowlist.** At `init_escrow` the
+  payer names the one issuer whose attestation can ever release *that* escrow;
+  the program stores it immutably in `Escrow.issuer` (SPEC §5.1). At release the
+  attesting key must equal that pin **and** still be on the allowlist — both
+  checks, never one substituted for the other (`lib.rs::release_with_proof`
+  steps 3 and 3b). An issuer added *after* a deposit fails the pin, because the
+  pin predates the compromise and no instruction can edit it. Error 6108
+  `IssuerNotPinned`.
+- **Why both checks, not just the pin:** the allowlist is what makes revocation
+  immediate. Remove a compromised issuer and every escrow already in flight stops
+  releasing on the next block. Dropping the allowlist in favour of the pin alone
+  would trade a governance risk for a worse one.
+- **What a compromised admin can still do:** remove a legitimate issuer, which
+  stops *new* releases. It cannot cause one. The worst reachable outcome is that
+  in-flight escrows expire and `refund_expired` returns every payer's funds to
+  the payer. The admin is a denial-of-service role, not a custody role. That
+  distinction is the whole claim.
+- **Separation of duties, enforced at runtime rather than by deploy convention.**
+  `init_config` has the **upgrade authority** sign — which is what closes the
+  init front-run — while *naming a different key* as admin. The account
+  constraints reject the transaction if one key would hold both
+  (`AdminIsUpgradeAuthority`). The same check runs again at `accept_admin`, so a
+  later rotation cannot silently re-collapse the two roles.
+- **Handover is two-step:** `propose_admin` (outgoing admin signs), then
+  `accept_admin` (nominee signs). A mistyped or hostile nomination has no effect
+  until the nominee proves possession of the key. Nothing changes on chain in
+  between.
+- **Residual risk is the program upgrade, not the admin key.** Whoever holds the
+  upgrade authority can deploy code without the pin check. The mitigation is
+  procedural: hold it in a multisig behind a timelock. `MAX_ESCROW_SECS` is 900
+  (15 minutes), so any timelock longer than 15 minutes guarantees every in-flight
+  escrow has already expired — and refunded — before new code can land. A 24-hour
+  timelock is a 96× margin. Burning the upgrade authority is *not* the answer: an
+  immutable deployment cannot run `init_config` at all.
+- **Allowlist changes emit `IssuerAdded`/`IssuerRemoved`** for the transparency
+  log and out-of-band monitoring. This is now detection, not the control.
+- **Evidence:** `cmd/escrowdevnet -mode deny-unpinned` (reference repo) runs this
+  attack on devnet with the admin key in hand. The `add_issuer(rogue)` succeeds —
+  the admin really can do it — and the release still fails 6108. The argument is
+  an explorer link, not a paragraph.
 
 ---
 
@@ -122,14 +167,39 @@ instruction was present.*
   impossible. **Fixed** by transferring the vault's live balance before close.
 - **T9 (admin bootstrap) — was MED/HIGH; fixed.** `init_config` was
   unauthenticated (first caller became admin and could allowlist a rogue issuer).
-  **Fixed:** `init_config` now requires `admin` to be the program's **upgrade
+  **Fixed:** `init_config` is authenticated against the program's **upgrade
   authority**, checked via the `ProgramData` account, with the `ProgramData` tied
   to this program through `program.programdata_address()`. The init front-run is
-  no longer possible; only the deployer can set the admin. Verified in the litesvm
-  integration test (init_config succeeds only when `admin` is the upgrade
-  authority). NOTE: this requires the program to be deployed **upgradeable** with a
-  real upgrade authority; an immutable (authority = None) deployment cannot run
-  `init_config` and must set the admin another way.
+  no longer possible; only the deployer can set the admin. NOTE: this requires the
+  program to be deployed **upgradeable** with a real upgrade authority; an
+  immutable (authority = None) deployment cannot run `init_config` and must set
+  the admin another way.
+
+- **T9 (role concentration) — the first fix was itself the next finding; fixed.**
+  The bootstrap fix above made the upgrade authority *become* the admin. That
+  closed the front-run and immediately opened a worse hole: one key held the
+  power to change the code **and** the power to change the issuer allowlist. A
+  single compromise was then total, and "who controls customer funds" had exactly
+  one honest answer — the operator. **Fixed** by separating the two roles at
+  runtime (the upgrade authority signs `init_config` but a *different* key is
+  named admin, enforced by account constraint) and, more importantly, by removing
+  the admin from the release path altogether via issuer pinning. See T9 above for
+  the full argument. Verified in the litesvm suite
+  (`programs/spt_x402_escrow/tests/integration.rs`) by eight tests:
+  `happy_path_then_replay_blocked`,
+  `compromised_admin_cannot_release_a_pinned_escrow`,
+  `revoked_issuer_cannot_release_even_when_pinned`,
+  `cannot_pin_an_unauthorized_issuer`,
+  `init_config_refuses_to_collapse_the_two_roles`,
+  `init_config_rejects_a_non_upgrade_authority_signer`,
+  `admin_rotation_is_two_step_and_transfers_the_role`, and
+  `admin_rotation_refuses_the_upgrade_authority`.
+
+  Worth recording plainly: the fix that closes one finding is a normal place for
+  the next one to appear. The bootstrap patch was correct about front-running and
+  wrong about custody, and nothing in the first review caught that because the
+  review question was "can an attacker seize the admin role", not "what does the
+  admin role let its legitimate holder do".
 
 ## Review gate
 

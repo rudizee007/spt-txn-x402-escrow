@@ -49,6 +49,7 @@ created for.
 |---|---|---|
 | Issuer signature authentic (Ed25519) | **On-chain** (precompile) + off-chain | Chain-verifiable with a standard precompile |
 | Signer is an **authorized** `tts_issuer` | **On-chain** (allowlist) + off-chain | Deny-by-default; a config the program owns |
+| Signer is the issuer **this payer pinned** | **On-chain only** (immutable in the escrow) | Removes the admin from the custody path (§5.2 step 2b) |
 | Payment amount/recipient/resource match the token | **On-chain** (digest equality) + off-chain | Reduces to a 32-byte constant-time compare |
 | Token not expired (short TTL) | **On-chain** (slot/clock bound) + off-chain | Chain has a clock; enforce a max age |
 | Scope ⊆ ceiling; delegation attenuation | **Off-chain only** | Requires chain-walking + policy; not chain-cheap |
@@ -108,16 +109,43 @@ signature over the token thus covers `binding`.
 
 ## 5. Escrow lifecycle
 
-Three instructions; all fail closed.
+Three custody instructions (plus the config/admin instructions in §5.4); all fail
+closed.
 
 ### 5.1 `init_escrow`
+Arguments, in Borsh order: `amount: u64`, `resource_id: [u8;32]`,
+`nonce: [u8;32]`, `issuer: Pubkey`.
+
 - **Payer** (the agent, or its funding authority) deposits `amount` of `mint`
   into an **Escrow PDA** derived from
   `["escrow", payer, recipient, binding]`.
 - Stores in the Escrow account: `payer`, `recipient`, `mint`, `amount`,
-  `binding:[u8;32]`, `expiry_slot:u64`, `bump`.
-- `expiry_slot = current_slot + MAX_ESCROW_SLOTS` (bounded; e.g. minutes).
-- No authorization is asserted here — this is custody setup only.
+  `issuer:Pubkey`, `binding:[u8;32]`, `nonce:[u8;32]`, `expiry_ts:i64`, `bump`,
+  `vault_bump`.
+- The program recomputes `binding` on-chain from the real account keys and these
+  arguments. It is **not** an argument: a caller cannot store a binding that
+  disagrees with the escrow it actually funded.
+- **`issuer` is the payer's choice and is immutable once written.** It pins the
+  single key whose attestation can ever release this escrow. Nothing — no admin
+  instruction, no allowlist edit — can change it afterwards. This is what makes a
+  compromised admin unable to reach funds that were already deposited (§5.2
+  step 2b, THREAT-MODEL T9).
+- `amount > 0`, else `InvalidAmount`.
+- The pinned `issuer` must be on the allowlist **at deposit time**, else
+  `IssuerNotAuthorized`. This is a usability guard, not the security control: a
+  pin nobody has authorized would make the deposit unreleasable and strand the
+  payer until expiry. The security control is the release-time pin check (§5.2
+  step 2b), which the payer's choice here fixes forever.
+- `expiry_ts = now + MAX_ESCROW_SECS` (900 s), on the on-chain `Clock`.
+- **No release authorization is asserted here** — this is custody setup. The
+  payer is not asserting the pinned issuer is trustworthy, only that it is the
+  one they are willing to be released by.
+
+> Ordering note for client authors: `resource_id`, `nonce` and `issuer` are three
+> consecutive 32-byte arguments and Borsh carries no field names. A transposition
+> is invisible to a length check and silent on chain — the escrow simply becomes
+> releasable by a key the payer never chose. The reference client pins the order
+> with a known-answer test (`escrow/anchor_test.go`).
 
 ### 5.2 `release_with_proof`  ← the enforcement instruction
 Releases `amount` to `recipient` iff **all** hold (else the instruction aborts and
@@ -128,7 +156,20 @@ nothing moves):
    the Instructions sysvar and confirms the precompile verified
    `(issuer_pubkey, token_msg, signature)`.
 2. **Issuer authorized.** `issuer_pubkey` ∈ the program's `IssuerAllowlist`
-   (set at program init / by an admin PDA). Unknown signer → **DENY**.
+   (`Config.issuers`, deny-by-default, maintained by the admin — §5.4). Unknown
+   signer → **DENY** (`IssuerNotAuthorized`, 6102).
+2b. **Issuer pinned.** `issuer_pubkey` equals `escrow.issuer` — the key *this
+   payer* named at deposit — compared in constant time. Not the pinned key →
+   **DENY** (`IssuerNotPinned`, 6108).
+
+   Steps 2 and 2b are **ANDed, never substituted for one another.** The allowlist
+   is a live, revocable, operator-held set; the pin is an immutable, payer-held
+   choice that predates any later allowlist edit. An issuer added *after* a
+   deposit satisfies 2 and fails 2b, which is precisely why an attacker holding
+   the admin key cannot release a single existing escrow (THREAT-MODEL T9). The
+   allowlist is still needed for the other direction: removing a compromised
+   issuer stops every in-flight escrow pinned to it on the next block, which the
+   pin alone could never do.
 3. **Binding match.** The `binding` committed inside `token_msg` equals the
    escrow's stored `binding`, compared in **constant time**. Mismatch → **DENY**.
 4. **Freshness.** The token's issued-at (carried in `token_msg`) is within
@@ -149,6 +190,59 @@ Finding 2) to `recipient`; close the vault and the escrow.
 - After `expiry_slot`, **anyone** may trigger a refund of the escrowed `amount`
   back to `payer`, closing the escrow. This guarantees funds are never trapped if
   a release never comes (fail-closed for liveness, safe for custody).
+- **Permissionless is deliberate, and is not a drain path.** The destination is
+  pinned twice — `payer_ata.owner == escrow.payer` and `address = escrow.payer` —
+  and is not an argument. The only thing an attacker achieves by calling it is
+  paying their own gas to return the payer's money to the payer. Making it
+  signer-gated would trade nothing for a liveness failure whenever the payer's
+  key is lost or the agent is abandoned.
+
+### 5.4 Config and admin instructions
+
+None of these can move funds. They exist to maintain the issuer allowlist and to
+keep the two operator roles — *who can change the code* and *who can change the
+allowlist* — in different hands at runtime rather than by deploy convention.
+
+**`init_config`** — one-time. Creates the `Config` PDA (`["config"]`) with an
+**empty** issuer allowlist: deny-by-default, nobody is authorized until added.
+
+- The **upgrade authority signs**, verified against the program's `ProgramData`
+  account (`program_data.upgrade_authority_address == upgrade_authority.key()`),
+  with `ProgramData` itself tied to this program via
+  `program.programdata_address()` so a foreign one cannot be substituted. This is
+  what makes the init front-run impossible: only the deployer can name the admin.
+- The signer **does not become the admin.** `admin` is a separate, non-signing
+  account key that is merely recorded, and the constraints reject the transaction
+  if `admin == upgrade_authority` (`AdminIsUpgradeAuthority`) or if `admin` is the
+  default pubkey (`InvalidAdmin`).
+- Requires an **upgradeable** deployment. An immutable program (authority `None`)
+  cannot run `init_config` at all — see THREAT-MODEL T9 on why burning the
+  upgrade authority is the wrong hardening move here.
+
+**`propose_admin(new_admin)`** — current admin signs (`has_one = admin`). Records
+`Config.pending_admin`. Nothing else changes; the current admin keeps the role.
+Rejects the default pubkey.
+
+**`accept_admin`** — the nominee signs, and must equal `pending_admin`
+(`NoPendingAdmin`). Only then does `admin` move and `pending_admin` clear. Two
+steps, because the first is an assertion and the second is proof of possession —
+a mistyped or hostile nomination has no on-chain effect. The upgrade-authority
+separation is **re-checked here**
+(`program_data.upgrade_authority_address != new_admin`), so a rotation months
+after deployment cannot quietly collapse the two roles back into one key.
+
+**`add_issuer(issuer)`** / **`remove_issuer(issuer)`** — admin signs. Add rejects
+duplicates (`IssuerAlreadyPresent`) and a full list (`AllowlistFull`,
+`MAX_ISSUERS`). Remove is idempotent. Both emit events
+(`IssuerAdded`/`IssuerRemoved`, plus `AdminProposed`/`AdminChanged` on the
+rotation path) for the transparency log — **detection, not the control.** The
+control is that neither instruction can reach an escrow that already exists
+(§5.2 step 2b).
+
+The complete set of admin powers is therefore: edit the allowlist, and hand the
+role over. That is a denial-of-service capability — the worst a compromised admin
+achieves is that in-flight escrows expire and `refund_expired` returns every
+payer's funds to the payer. It is not a custody capability.
 
 ---
 
